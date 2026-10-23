@@ -41,6 +41,7 @@ DATA_DIR = BASE_DIR / "data"
 UNIVERSE_FILE = DATA_DIR / "universe.csv"       # プライム全銘柄＋業種（キャッシュ）
 TOPN_FILE = DATA_DIR / "top_turnover.csv"       # 朝に作る売買代金上位リスト
 WATCHLIST_FILE = BASE_DIR / "watchlist.txt"     # 毎回必ず対象に含める銘柄コード
+SECTOR_TREND_FILE = DATA_DIR / "sector_trend.csv"  # 朝に作る業種の環境（プライム全銘柄）
 UNIVERSE_MAX_AGE_DAYS = 7
 MODE_LABEL = {"morning": "朝（前日データ）", "yori": "寄り後", "zenba": "前場後", "close": "大引け後"}
 
@@ -233,14 +234,14 @@ def load_watchlist() -> list[str]:
     return codes
 
 
-def apply_session_cut(prices: dict[str, pd.DataFrame], today: date, cutoff_hm: tuple[int, int],
-                      chunk: int = 100) -> int:
-    """5分足から「cutoff時刻まで」の当日OHLCVを作り、日足の当日行を置き換える。
-    前場後モードで、実行が遅れて後場のデータが混ざるのを防ぐ。戻り値は置き換えた銘柄数。"""
+def fetch_intraday(tickers: list[str], today: date, cutoff_hm: tuple[int, int] | None,
+                   chunk: int = 100) -> dict[str, pd.DataFrame]:
+    """当日の5分足を取得する（cutoff_hm を指定するとその時刻より前の足だけ）。"""
     import yfinance as yf
 
-    tickers = list(prices)
-    replaced = 0
+    out: dict[str, pd.DataFrame] = {}
+    cut = (datetime(today.year, today.month, today.day, *cutoff_hm, tzinfo=JST)
+           if cutoff_hm else None)
     for i in range(0, len(tickers), chunk):
         part = tickers[i:i + chunk]
         try:
@@ -254,24 +255,110 @@ def apply_session_cut(prices: dict[str, pd.DataFrame], today: date, cutoff_hm: t
             idx = idx.tz_convert("Asia/Tokyo") if idx.tz is not None else idx.tz_localize("Asia/Tokyo")
             bars = bars.copy()
             bars.index = idx
-            cut = datetime(today.year, today.month, today.day, *cutoff_hm, tzinfo=JST)
-            b = bars[(bars.index.date == today) & (bars.index < cut)]
-            if b.empty:
-                continue
-            row = {"Open": b["Open"].iloc[0], "High": b["High"].max(), "Low": b["Low"].min(),
-                   "Close": b["Close"].iloc[-1], "Volume": b["Volume"].sum()}
-            row["Adj Close"] = row["Close"]
-            df = prices[t]
-            df = df[[pd.Timestamp(d).date() != today for d in df.index]].copy()
-            new = pd.DataFrame([row], index=[pd.Timestamp(today)])
-            prices[t] = pd.concat([df, new[[c for c in df.columns if c in new.columns]]]).sort_index()
-            replaced += 1
+            b = bars[bars.index.date == today]
+            if cut is not None:
+                b = b[b.index < cut]
+            if not b.empty:
+                out[t] = b
         time.sleep(1.0)
+    return out
+
+
+def replace_today_row(prices: dict[str, pd.DataFrame], bars_map: dict[str, pd.DataFrame],
+                      today: date) -> int:
+    """5分足から作った当日OHLCVで、日足の当日行を置き換える（前場後モード用）。"""
+    replaced = 0
+    for t, b in bars_map.items():
+        if t not in prices:
+            continue
+        row = {"Open": b["Open"].iloc[0], "High": b["High"].max(), "Low": b["Low"].min(),
+               "Close": b["Close"].iloc[-1], "Volume": b["Volume"].sum()}
+        row["Adj Close"] = row["Close"]
+        df = prices[t]
+        df = df[[pd.Timestamp(d).date() != today for d in df.index]].copy()
+        new = pd.DataFrame([row], index=[pd.Timestamp(today)])
+        prices[t] = pd.concat([df, new[[c for c in df.columns if c in new.columns]]]).sort_index()
+        replaced += 1
     return replaced
 
 
+# ---------------------------------------------------------------- 基調の判定
+TREND_RULE = ("環境（日足・前日まで）：上昇基調＝終値が25日線より上 かつ 25日線が上向き（5日前より上） "
+              "かつ 5日線が25日線より上／下落基調＝その逆／それ以外＝横ばい")
+FLOW_MIN_OPEN = 0.3   # 始値比がこれ未満（±%）の小さな動きは方向とみなさない
+FLOW_MIN_VWAP = 0.1   # VWAP比がこれ未満（±%）の小さな乖離は方向とみなさない
+FLOW_RULE = (f"当日の流れ（5分足）：買い優勢＝始値より{FLOW_MIN_OPEN}%以上上 かつ VWAPより{FLOW_MIN_VWAP}%以上上 "
+             "かつ 高値・安値が切り下げでない／売り優勢＝その逆／それ以外＝方向感なし。"
+             "高安は前半と後半の高値・安値の比較。指数はVWAPなし")
+
+
+def daily_trend(df: pd.DataFrame) -> dict:
+    """日足（前日までの確定分）から環境を判定する。"""
+    c = df["Close"].dropna()
+    if len(c) < 30:
+        return {"環境": "判定不可", "25日線比%": np.nan, "25日線の向き%": np.nan,
+                "5日騰落%": np.nan, "20日騰落%": np.nan}
+    ma5, ma25 = c.rolling(5).mean(), c.rolling(25).mean()
+    last, m25, m25_prev = c.iloc[-1], ma25.iloc[-1], ma25.iloc[-6]
+    slope = (m25 / m25_prev - 1) * 100
+    if last > m25 and slope > 0 and ma5.iloc[-1] > m25:
+        env = "上昇基調"
+    elif last < m25 and slope < 0 and ma5.iloc[-1] < m25:
+        env = "下落基調"
+    else:
+        env = "横ばい"
+    return {"環境": env,
+            "25日線比%": round((last / m25 - 1) * 100, 2),
+            "25日線の向き%": round(slope, 2),
+            "5日騰落%": round((last / c.iloc[-6] - 1) * 100, 2),
+            "20日騰落%": round((last / c.iloc[-21] - 1) * 100, 2)}
+
+
+NO_FLOW = {"当日の流れ": "—", "始値比%": np.nan, "VWAP比%": np.nan, "高安": "—", "前日レンジ": "—"}
+
+
+def intraday_flow(bars: pd.DataFrame | None, prev_high: float, prev_low: float) -> dict:
+    """当日の5分足から当日の流れを判定する。"""
+    if bars is None or bars.dropna(subset=["Close"]).empty:
+        return dict(NO_FLOW, 当日の流れ="判定不可")
+    b = bars.dropna(subset=["Close"])
+    o, last = b["Open"].iloc[0], b["Close"].iloc[-1]
+    vol = b["Volume"].fillna(0)
+    tp = (b["High"] + b["Low"] + b["Close"]) / 3
+    vwap = (tp * vol).sum() / vol.sum() if vol.sum() > 0 else np.nan
+    from_open = (last / o - 1) * 100 if o else np.nan
+    vwap_dev = (last / vwap - 1) * 100 if vwap == vwap and vwap else np.nan
+    if len(b) >= 4:
+        h = len(b) // 2
+        a, z = b.iloc[:h], b.iloc[h:]
+        up = z["High"].max() > a["High"].max() and z["Low"].min() > a["Low"].min()
+        down = z["High"].max() < a["High"].max() and z["Low"].min() < a["Low"].min()
+        struct = "切り上げ" if up else "切り下げ" if down else "もみ合い"
+    else:
+        struct = "データ不足"
+    if last > prev_high:
+        pos = "前日高値超え"
+    elif last < prev_low:
+        pos = "前日安値割れ"
+    else:
+        pos = "前日レンジ内"
+    vw_ok_up = np.isnan(vwap_dev) or vwap_dev >= FLOW_MIN_VWAP
+    vw_ok_dn = np.isnan(vwap_dev) or vwap_dev <= -FLOW_MIN_VWAP
+    if from_open >= FLOW_MIN_OPEN and vw_ok_up and struct != "切り下げ":
+        flow = "買い優勢"
+    elif from_open <= -FLOW_MIN_OPEN and vw_ok_dn and struct != "切り上げ":
+        flow = "売り優勢"
+    else:
+        flow = "方向感なし"
+    return {"当日の流れ": flow,
+            "始値比%": round(from_open, 2),
+            "VWAP比%": round(vwap_dev, 2) if vwap_dev == vwap_dev else np.nan,
+            "高安": struct, "前日レンジ": pos}
+
+
 # ---------------------------------------------------------------- 指標計算
-def calc_metrics(df: pd.DataFrame, mode: str, today: date) -> dict | None:
+def calc_metrics(df: pd.DataFrame, mode: str, today: date,
+                 bars: pd.DataFrame | None = None) -> dict | None:
     df = df.sort_index()
     idx_dates = pd.Index([pd.Timestamp(d).date() for d in df.index])
     df = df.copy()
@@ -304,11 +391,11 @@ def calc_metrics(df: pd.DataFrame, mode: str, today: date) -> dict | None:
 
     rng_pct = (cur["High"] - cur["Low"]) / pc * 100
     atr_pct = atr / pc * 100
-    return {
+    m = {
         "データ日付": df.index[-1].isoformat(),
         "現在値": round(float(cur["Close"]), 1),
         "前日比%": round((cur["Close"] / pc - 1) * 100, 2),
-        "始値比%": round((cur["Close"] / cur["Open"] - 1) * 100, 2) if cur["Open"] else np.nan,
+        "始値比_日足%": round((cur["Close"] / cur["Open"] - 1) * 100, 2) if cur["Open"] else np.nan,
         "日中値幅%": round(rng_pct, 2),
         "ATR14%": round(atr_pct, 2),
         "値幅/ATR": round(rng_pct / atr_pct, 2) if atr_pct else np.nan,
@@ -318,19 +405,95 @@ def calc_metrics(df: pd.DataFrame, mode: str, today: date) -> dict | None:
         "売買代金20日平均_億円": round(float(turnover.iloc[:-1].tail(20).mean()), 1),
         "備考": flag,
     }
+    # 環境：朝は前日まで（＝当日行なし）、それ以外は当日行を除いた前日まで
+    base = df if mode == "morning" or flag else hist
+    m.update(daily_trend(base))
+    if mode == "morning" or flag:
+        m.update(NO_FLOW)
+    else:
+        m.update(intraday_flow(bars, float(prev["High"]), float(prev["Low"])))
+    return m
 
 
-def build_stock_table(prices: dict[str, pd.DataFrame], uni: pd.DataFrame,
-                      mode: str, today: date) -> pd.DataFrame:
+def build_stock_table(prices: dict[str, pd.DataFrame], uni: pd.DataFrame, mode: str,
+                      today: date, bars_map: dict[str, pd.DataFrame] | None = None) -> pd.DataFrame:
     rows = []
     meta = uni.set_index("ticker")
+    bars_map = bars_map or {}
     for t, df in prices.items():
-        m = calc_metrics(df, mode, today)
+        m = calc_metrics(df, mode, today, bars_map.get(t))
         if m is None or t not in meta.index:
             continue
         rows.append({"コード": meta.at[t, "コード"], "銘柄名": meta.at[t, "銘柄名"],
                      "業種": meta.at[t, "業種"], **m})
     return pd.DataFrame(rows)
+
+
+MARKET_TICKERS = {"^N225": "日経平均", "1306.T": "TOPIX連動ETF（1306）"}
+
+
+def build_market_table(mode: str, today: date, cutoff_hm: tuple[int, int] | None) -> pd.DataFrame:
+    """日経平均とTOPIX連動ETFの環境・当日の流れ。"""
+    tickers = list(MARKET_TICKERS)
+    prices = download_prices(tickers)
+    bars_map = fetch_intraday(tickers, today, cutoff_hm) if mode != "morning" else {}
+    if cutoff_hm:
+        replace_today_row(prices, bars_map, today)
+    rows = []
+    for t, name in MARKET_TICKERS.items():
+        m = calc_metrics(prices[t], mode, today, bars_map.get(t)) if t in prices else None
+        if m is None:
+            rows.append({"指標": name, "環境": "未確認", "当日の流れ": "未確認"})
+            continue
+        rows.append({"指標": name, **m})
+    return pd.DataFrame(rows)
+
+
+def _label_sector_trend(g: pd.DataFrame) -> str:
+    up = (g["環境"] == "上昇基調").mean()
+    down = (g["環境"] == "下落基調").mean()
+    above = (g["25日線比%"] > 0).mean()
+    r20 = g["20日騰落%"].mean()
+    is_up = up >= 0.5 or (above >= 0.6 and r20 > 0)
+    is_down = down >= 0.5 or (above <= 0.4 and r20 < 0)
+    if is_up and not is_down:
+        return "上昇基調"
+    if is_down and not is_up:
+        return "下落基調"
+    if is_up and is_down:
+        return "上昇基調" if r20 > 0 else "下落基調"
+    return "横ばい"
+
+
+def build_sector_trend(stocks: pd.DataFrame, today: date) -> pd.DataFrame:
+    rows = []
+    for sec, g in stocks.groupby("業種"):
+        g = g[g["環境"].isin(["上昇基調", "下落基調", "横ばい"])]
+        if g.empty:
+            continue
+        rows.append({"業種": sec, "業種の環境": _label_sector_trend(g),
+                     "上昇基調の割合%": round((g["環境"] == "上昇基調").mean() * 100),
+                     "下落基調の割合%": round((g["環境"] == "下落基調").mean() * 100),
+                     "25日線より上の割合%": round((g["25日線比%"] > 0).mean() * 100),
+                     "平均5日騰落%": round(g["5日騰落%"].mean(), 2),
+                     "平均20日騰落%": round(g["20日騰落%"].mean(), 2),
+                     "判定銘柄数": len(g), "作成日": today.isoformat()})
+    return pd.DataFrame(rows)
+
+
+def sector_flow(stocks: pd.DataFrame) -> pd.Series:
+    out = {}
+    for sec, g in stocks.groupby("業種"):
+        f = g["当日の流れ"]
+        n = f.isin(["買い優勢", "売り優勢", "方向感なし"]).sum()
+        if n == 0:
+            out[sec] = "—"
+            continue
+        buy, sell = (f == "買い優勢").sum(), (f == "売り優勢").sum()
+        lbl = ("買い優勢" if buy / n >= 0.5 and buy > sell else
+               "売り優勢" if sell / n >= 0.5 and sell > buy else "方向感なし")
+        out[sec] = f"{lbl}（買{buy}・売{sell}／{n}）"
+    return pd.Series(out)
 
 
 def build_sector_table(stocks: pd.DataFrame) -> pd.DataFrame:
@@ -399,19 +562,41 @@ def markdown_summary(mode: str, now: datetime, sectors: pd.DataFrame, stocks: pd
     return "\n".join(L)
 
 
+def _f(v, fmt: str = "{}") -> str:
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "—"
+    try:
+        return fmt.format(v)
+    except (ValueError, TypeError):
+        return str(v)
+
+
+def _row(cells: list[str]) -> str:
+    return "| " + " | ".join(cells) + " |"
+
+
+def _head(cols: list[str]) -> list[str]:
+    return [_row(cols), _row(["---"] * len(cols))]
+
+
+STOCK_COLS = ["コード", "銘柄名", "業種", "現在値", "前日比", "日中値幅", "値幅/ATR", "出来高倍率",
+              "売買代金(億)", "環境", "25日線比", "当日の流れ", "始値比", "VWAP比", "高安", "前日レンジ", "備考"]
+
+
 def _stock_line(s: pd.Series) -> str:
-    return (f"| {s['コード']} | {s['銘柄名']} | {s['業種']} | {s['現在値']:,.1f} | {s['前日比%']:+.2f}% | "
-            f"{s['日中値幅%']:.2f}% | {s['値幅/ATR']:.2f} | {s['出来高倍率']:.2f} | {s['売買代金_億円']:,.0f} | {s['備考']} |")
+    return _row([str(s["コード"]), str(s["銘柄名"]), str(s["業種"]), _f(s["現在値"], "{:,.1f}"),
+                 _f(s["前日比%"], "{:+.2f}%"), _f(s["日中値幅%"], "{:.2f}%"), _f(s["値幅/ATR"], "{:.2f}"),
+                 _f(s["出来高倍率"], "{:.2f}"), _f(s["売買代金_億円"], "{:,.0f}"), _f(s["環境"]),
+                 _f(s["25日線比%"], "{:+.2f}%"), _f(s["当日の流れ"]), _f(s["始値比%"], "{:+.2f}%"),
+                 _f(s["VWAP比%"], "{:+.2f}%"), _f(s["高安"]), _f(s["前日レンジ"]), _f(s["備考"] or "")])
 
 
-STOCK_HEAD = ["| コード | 銘柄名 | 業種 | 現在値 | 前日比 | 日中値幅 | 値幅/ATR | 出来高倍率 | 売買代金(億) | 備考 |",
-              "|---|---|---|---|---|---|---|---|---|---|"]
-
-
-def report_markdown(mode: str, now: datetime, stocks: pd.DataFrame, watch: list[str],
+def report_markdown(mode: str, now: datetime, stocks: pd.DataFrame, sectors: pd.DataFrame,
+                    market: pd.DataFrame, sec_trend: pd.DataFrame, watch: list[str],
                     basis: str, min_turnover: float) -> str:
     """Claudeのレポートが読む用のまとめ（data/latest_<mode>.md）。"""
     data_date = stocks["データ日付"].mode().iloc[0] if not stocks.empty else ""
+    trend_date = sec_trend["作成日"].iloc[0] if not sec_trend.empty else "未作成"
     L = [f"# 33業種スキャン {MODE_LABEL[mode]}",
          "",
          f"- 取得時刻: {now:%Y-%m-%d %H:%M} JST",
@@ -420,18 +605,52 @@ def report_markdown(mode: str, now: datetime, stocks: pd.DataFrame, watch: list[
          "- 出典: Yahoo Finance（yfinance、東証は約20分遅延）",
          "- 売買代金は (高値+安値+終値)/3×出来高 の概算。出来高倍率は過去20日平均との比較",
          "",
-         "## ウォッチリスト", ""] + STOCK_HEAD
-    w = stocks.set_index("コード")
+         "## デイトレ視点",
+         "",
+         "機械的なルールによる分類で、売買の推奨ではない。",
+         "",
+         f"- {TREND_RULE}",
+         f"- {FLOW_RULE}" + ("（朝モードは当日データがないため「—」）" if mode == "morning" else ""),
+         "",
+         "### 市場全体", ""]
+    L += _head(["指標", "現在値", "前日比", "環境", "25日線比", "25日線の向き", "当日の流れ",
+                "始値比", "高安", "前日レンジ"])
+    for _, r in market.iterrows():
+        g = r.get
+        L.append(_row([str(g("指標")), _f(g("現在値"), "{:,.1f}"), _f(g("前日比%"), "{:+.2f}%"),
+                       _f(g("環境")), _f(g("25日線比%"), "{:+.2f}%"), _f(g("25日線の向き%"), "{:+.2f}%"),
+                       _f(g("当日の流れ")), _f(g("始値比%"), "{:+.2f}%"), _f(g("高安")), _f(g("前日レンジ"))]))
+
+    L += ["", "### 業種（平均日中値幅の大きい順）", "",
+          f"騰落率は構成銘柄の単純平均（業種の順位は公式の業種別指数を使うこと）。"
+          f"業種の環境は {trend_date} 朝のプライム全銘柄から判定。", ""]
+    sec = sectors.set_index("業種")
+    tr = sec_trend.set_index("業種") if not sec_trend.empty else pd.DataFrame()
+    flow = sector_flow(stocks)
+    L += _head(["業種", "騰落率", "平均値幅", "値幅/ATR", "売買代金(億)", "銘柄数", "業種の環境",
+                "25日線より上", "平均20日騰落", "当日の流れ（銘柄数）"])
+    for name, r in sec.sort_values("平均日中値幅%", ascending=False).iterrows():
+        t = tr.loc[name] if name in tr.index else {}
+        L.append(_row([str(name), _f(r["平均騰落率%"], "{:+.2f}%"), _f(r["平均日中値幅%"], "{:.2f}%"),
+                       _f(r["平均値幅/ATR"], "{:.2f}"), _f(r["売買代金合計_億円"], "{:,.0f}"),
+                       str(r["構成銘柄数"]), _f(t.get("業種の環境") if len(t) else None),
+                       _f(t.get("25日線より上の割合%") if len(t) else None, "{:.0f}%"),
+                       _f(t.get("平均20日騰落%") if len(t) else None, "{:+.2f}%"),
+                       _f(flow.get(name))]))
+
+    liquid = stocks[stocks["売買代金_億円"] >= min_turnover]
+    L += ["", f"### 候補銘柄：日中値幅が大きい 上位15（売買代金{min_turnover:g}億円以上）", ""]
+    L += _head(STOCK_COLS) + [_stock_line(s) for _, s in liquid.nlargest(15, "日中値幅%").iterrows()]
+    L += ["", f"### 候補銘柄：いつもより動いている 上位10（値幅/ATR順、売買代金{min_turnover:g}億円以上）", ""]
+    L += _head(STOCK_COLS) + [_stock_line(s) for _, s in liquid.nlargest(10, "値幅/ATR").iterrows()]
+
+    L += ["", "## ウォッチリスト", ""] + _head(STOCK_COLS)
+    w = stocks.drop_duplicates("コード").set_index("コード", drop=False)
     for code in watch:
         if code in w.index:
-            L.append(_stock_line(w.loc[code].to_frame().T.assign(コード=code).iloc[0]))
+            L.append(_stock_line(w.loc[code]))
         else:
-            L.append(f"| {code} | 取得できず | | | | | | | | 未確認 |")
-    liquid = stocks[stocks["売買代金_億円"] >= min_turnover]
-    L += ["", f"## 日中値幅が大きい銘柄 上位15（売買代金{min_turnover:g}億円以上）", ""] + STOCK_HEAD
-    L += [_stock_line(s) for _, s in liquid.nlargest(15, "日中値幅%").iterrows()]
-    L += ["", f"## いつもより動いている銘柄 上位10（値幅/ATR順、売買代金{min_turnover:g}億円以上）", ""] + STOCK_HEAD
-    L += [_stock_line(s) for _, s in liquid.nlargest(10, "値幅/ATR").iterrows()]
+            L.append(_row([code, "取得できず"] + [""] * (len(STOCK_COLS) - 3) + ["未確認"]))
     return "\n".join(L) + "\n"
 
 
@@ -471,17 +690,23 @@ def main(argv: list[str] | None = None) -> int:
         watch_t = [c + ".T" for c in watch]
         target = uni[uni["ticker"].isin(set(target["ticker"]) | set(watch_t))]
 
-    prices = download_prices(target["ticker"].tolist())
+    tickers = target["ticker"].tolist()
+    prices = download_prices(tickers)
     basis = {"morning": "前日の終値（確定値）",
              "yori": f"約20分遅延のため {(now - timedelta(minutes=20)):%H:%M}ごろまで",
              "zenba": "前場（〜11:30）",
              "close": "大引け（確定値）"}[mode]
+    cutoff = (11, 30) if mode == "zenba" else None
+    bars_map: dict[str, pd.DataFrame] = {}
+    if mode != "morning":
+        bars_map = fetch_intraday(tickers, today, cutoff)
+        print(f"当日の5分足を取得: {len(bars_map)}/{len(tickers)}銘柄")
     if mode == "zenba":
-        n = apply_session_cut(prices, today, (11, 30))
+        n = replace_today_row(prices, bars_map, today)
         print(f"前場の5分足で当日値を置き換え: {n}/{len(prices)}銘柄")
         if n < len(prices) * 0.5:
             basis = f"日足（{(now - timedelta(minutes=20)):%H:%M}ごろまで。後場が混ざっている可能性あり）"
-    stocks = build_stock_table(prices, uni, mode, today)
+    stocks = build_stock_table(prices, uni, mode, today, bars_map)
     if stocks.empty:
         print("データが取得できませんでした。", file=sys.stderr)
         return 1
@@ -505,8 +730,19 @@ def main(argv: list[str] | None = None) -> int:
         top["作成日"] = today.isoformat()
         top.to_csv(TOPN_FILE, index=False, encoding="utf-8-sig")
         print(f"売買代金上位 {len(top)}銘柄のリストを更新: {TOPN_FILE.name}")
+        sec_trend = build_sector_trend(stocks, today)
+        sec_trend.to_csv(SECTOR_TREND_FILE, index=False, encoding="utf-8-sig")
+        print(f"業種の環境を更新: {SECTOR_TREND_FILE.name}")
+    elif SECTOR_TREND_FILE.exists():
+        sec_trend = pd.read_csv(SECTOR_TREND_FILE)
+    else:
+        print("[注意] 業種の環境ファイルがないため、対象銘柄だけで判定します。")
+        sec_trend = build_sector_trend(stocks, today)
 
-    report = report_markdown(mode, now, stocks, watch, basis, args.min_turnover)
+    market = build_market_table(mode, today, cutoff)
+
+    report = report_markdown(mode, now, stocks, sectors, market, sec_trend, watch, basis,
+                             args.min_turnover)
     (DATA_DIR / f"latest_{mode}.md").write_text(report, encoding="utf-8")
     print(f"レポート用まとめ: data/latest_{mode}.md")
 
