@@ -1,0 +1,523 @@
+#!/usr/bin/env python3
+"""
+東証プライム 33業種・銘柄の値動きスキャン（デイトレ向きセクター／銘柄探し用）
+
+データ元: Yahoo Finance（yfinance）… 東証は約20分遅延
+業種区分: JPX「東証上場銘柄一覧」（data_j.xls）の33業種区分
+
+モード
+  morning : プライム全銘柄の「前日」データ。売買代金上位リストも作る
+  yori    : 寄り付き後の当日データ（9:30実行で9:10ごろまでの値動き）。売買代金上位銘柄のみ
+  zenba   : 当日の前場データ（11:50以降推奨）。売買代金上位銘柄のみ
+  close   : 当日の大引けデータ（15:50以降推奨）。売買代金上位銘柄のみ
+  auto    : 実行時刻（日本時間）から自動判定
+
+出力（data/ フォルダ、UTF-8 BOM付きCSV）
+  YYYY-MM-DD_<mode>_sectors.csv : 33業種ごとの集計
+  YYYY-MM-DD_<mode>_stocks.csv  : 銘柄ごとの指標
+"""
+from __future__ import annotations
+
+import argparse
+import io
+import os
+import re
+import sys
+import time
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+JST = timezone(timedelta(hours=9))
+JPX_PAGE = "https://www.jpx.co.jp/markets/statistics-equities/misc/01.html"
+JPX_FALLBACK = (
+    "https://www.jpx.co.jp/markets/statistics-equities/misc/"
+    "tvdivq0000001vg2-att/data_j.xls"
+)
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+UNIVERSE_FILE = DATA_DIR / "universe.csv"       # プライム全銘柄＋業種（キャッシュ）
+TOPN_FILE = DATA_DIR / "top_turnover.csv"       # 朝に作る売買代金上位リスト
+WATCHLIST_FILE = BASE_DIR / "watchlist.txt"     # 毎回必ず対象に含める銘柄コード
+UNIVERSE_MAX_AGE_DAYS = 7
+MODE_LABEL = {"morning": "朝（前日データ）", "yori": "寄り後", "zenba": "前場後", "close": "大引け後"}
+
+
+# ---------------------------------------------------------------- モード判定
+def resolve_mode(mode: str, now: datetime) -> str:
+    if mode != "auto":
+        return mode
+    if now.weekday() >= 5:                       # 土日は直近営業日の振り返り
+        return "morning"
+    hm = now.hour * 60 + now.minute
+    if hm < 9 * 60:
+        return "morning"
+    if hm < 10 * 60 + 30:
+        return "yori"
+    if hm < 12 * 60 + 30:
+        return "zenba"
+    return "close"
+
+
+def timing_warning(mode: str, now: datetime) -> str | None:
+    hm = now.hour * 60 + now.minute
+    if now.weekday() >= 5:
+        return None
+    if mode == "yori" and hm < 9 * 60 + 20:
+        return "9:20より前のため、当日のデータがまだほとんどありません（約20分遅延）。"
+    if mode == "yori":
+        return f"約20分遅延のため、{(now - timedelta(minutes=20)):%H:%M}ごろまでの値動きです。出来高倍率は1日平均との比較なので小さく出ます。"
+    if mode == "zenba" and hm < 11 * 60 + 50:
+        return "11:50より前のため、前場の最後の約20分が反映されていません。"
+    if mode == "close" and hm < 15 * 60 + 50:
+        return "15:50より前のため、大引けまでのデータがそろっていません（場中の値）。"
+    return None
+
+
+# ---------------------------------------------------------------- 銘柄一覧
+def _find_col(df: pd.DataFrame, *keywords: str) -> str:
+    for c in df.columns:
+        if all(k in str(c) for k in keywords):
+            return c
+    raise KeyError(f"列が見つかりません: {keywords} / 列一覧: {list(df.columns)}")
+
+
+def parse_jpx_list(raw: pd.DataFrame) -> pd.DataFrame:
+    """JPXの上場銘柄一覧からプライム（内国株式）だけを取り出す。"""
+    c_code = _find_col(raw, "コード")
+    c_name = _find_col(raw, "銘柄名")
+    c_mkt = _find_col(raw, "市場")
+    c_sec = _find_col(raw, "33業種区分")
+    df = raw[[c_code, c_name, c_mkt, c_sec]].copy()
+    df.columns = ["コード", "銘柄名", "市場", "業種"]
+    df = df[df["市場"].astype(str).str.contains("プライム")
+            & df["市場"].astype(str).str.contains("内国")]
+    df["コード"] = df["コード"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
+    df["ticker"] = df["コード"] + ".T"
+    return df[["コード", "銘柄名", "業種", "ticker"]].reset_index(drop=True)
+
+
+def _read_excel_bytes(content: bytes) -> pd.DataFrame:
+    """中身の先頭バイトで形式を判定して読む（.xls / .xlsx）。"""
+    if content[:4] == b"\xd0\xcf\x11\xe0":
+        return pd.read_excel(io.BytesIO(content), dtype=str, engine="xlrd")
+    if content[:2] == b"PK":
+        return pd.read_excel(io.BytesIO(content), dtype=str, engine="openpyxl")
+    head = content[:200].decode("utf-8", errors="replace").replace("\n", " ")
+    raise ValueError(f"Excelファイルではありません（先頭: {head!r}）")
+
+
+def _local_jpx_file() -> Path | None:
+    """リポジトリに置いた data_j.xls / data_j.xlsx があればそれを使う。"""
+    for d in (BASE_DIR, DATA_DIR):
+        for name in ("data_j.xls", "data_j.xlsx"):
+            if (d / name).exists():
+                return d / name
+    return None
+
+
+def _save_universe(raw: pd.DataFrame, source: str) -> pd.DataFrame:
+    uni = parse_jpx_list(raw)
+    uni["取得日"] = datetime.now(JST).date().isoformat()
+    DATA_DIR.mkdir(exist_ok=True)
+    uni.to_csv(UNIVERSE_FILE, index=False, encoding="utf-8-sig")
+    print(f"銘柄一覧: {source} からプライム {len(uni)}銘柄")
+    return uni
+
+
+def load_universe(force: bool = False) -> pd.DataFrame:
+    local = _local_jpx_file()
+    if local:
+        return _save_universe(_read_excel_bytes(local.read_bytes()), local.name)
+
+    cached = pd.read_csv(UNIVERSE_FILE, dtype=str) if UNIVERSE_FILE.exists() else None
+    if cached is not None and not force:
+        fetched = date.fromisoformat(cached["取得日"].iloc[0])
+        if (datetime.now(JST).date() - fetched).days < UNIVERSE_MAX_AGE_DAYS:
+            return cached
+
+    import requests
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                             "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+               "Accept-Language": "ja,en;q=0.8"}
+    urls = []
+    try:
+        r = requests.get(JPX_PAGE, headers=headers, timeout=30)
+        print(f"JPXページ: HTTP {r.status_code}")
+        for m in re.finditer(r'href=["\']([^"\']*data_j\.xlsx?)["\']', r.text):
+            urls.append(requests.compat.urljoin(JPX_PAGE, m.group(1)))
+    except Exception as e:
+        print(f"[注意] JPXページ取得失敗: {e}", file=sys.stderr)
+    urls.append(JPX_FALLBACK)
+
+    for url in dict.fromkeys(urls):
+        try:
+            r = requests.get(url, headers=headers, timeout=60)
+            print(f"銘柄一覧を取得中: {url} → HTTP {r.status_code}, {len(r.content)} bytes")
+            return _save_universe(_read_excel_bytes(r.content), url)
+        except Exception as e:
+            print(f"[注意] 取得失敗: {e}", file=sys.stderr)
+
+    if cached is not None:
+        print("[注意] 銘柄一覧を更新できなかったため、前回の一覧を使います。", file=sys.stderr)
+        return cached
+    raise SystemExit(
+        "JPXの銘柄一覧を自動で取得できませんでした。\n"
+        "JPXサイト「東証上場銘柄一覧」から data_j.xls をダウンロードし、"
+        "リポジトリのトップにアップロードしてから再実行してください。")
+
+
+# ---------------------------------------------------------------- 株価取得
+def _split_download(data: pd.DataFrame, tickers: list[str]) -> dict[str, pd.DataFrame]:
+    out: dict[str, pd.DataFrame] = {}
+    if data is None or data.empty:
+        return out
+    if isinstance(data.columns, pd.MultiIndex):
+        lv0 = set(data.columns.get_level_values(0))
+        for t in tickers:
+            if t in lv0:
+                df = data[t]
+            elif t in set(data.columns.get_level_values(1)):
+                df = data.xs(t, axis=1, level=1)
+            else:
+                continue
+            df = df.dropna(subset=["Close"])
+            if not df.empty:
+                out[t] = df
+    elif len(tickers) == 1:
+        df = data.dropna(subset=["Close"])
+        if not df.empty:
+            out[tickers[0]] = df
+    return out
+
+
+def download_prices(tickers: list[str], chunk: int = 100, period: str = "3mo") -> dict[str, pd.DataFrame]:
+    import yfinance as yf
+
+    result: dict[str, pd.DataFrame] = {}
+    pending = list(tickers)
+    for attempt in range(2):                       # 失敗分は1回だけ再試行
+        failed: list[str] = []
+        for i in range(0, len(pending), chunk):
+            part = pending[i:i + chunk]
+            try:
+                data = yf.download(part, period=period, interval="1d", group_by="ticker",
+                                   auto_adjust=False, threads=True, progress=False)
+            except Exception as e:
+                print(f"[注意] 取得エラー: {e}", file=sys.stderr)
+                data = None
+            got = _split_download(data, part)
+            result.update(got)
+            failed += [t for t in part if t not in got]
+            print(f"  取得 {min(i + chunk, len(pending))}/{len(pending)}（成功累計 {len(result)}）")
+            time.sleep(1.0)
+        if not failed:
+            break
+        pending = failed
+        if attempt == 0:
+            print(f"取得失敗 {len(failed)}銘柄を再試行します…")
+            time.sleep(5)
+    return result
+
+
+def load_watchlist() -> list[str]:
+    if not WATCHLIST_FILE.exists():
+        return []
+    codes = []
+    for line in WATCHLIST_FILE.read_text(encoding="utf-8").splitlines():
+        code = line.split("#")[0].strip()
+        if code:
+            codes.append(code)
+    return codes
+
+
+def apply_session_cut(prices: dict[str, pd.DataFrame], today: date, cutoff_hm: tuple[int, int],
+                      chunk: int = 100) -> int:
+    """5分足から「cutoff時刻まで」の当日OHLCVを作り、日足の当日行を置き換える。
+    前場後モードで、実行が遅れて後場のデータが混ざるのを防ぐ。戻り値は置き換えた銘柄数。"""
+    import yfinance as yf
+
+    tickers = list(prices)
+    replaced = 0
+    for i in range(0, len(tickers), chunk):
+        part = tickers[i:i + chunk]
+        try:
+            data = yf.download(part, period="1d", interval="5m", group_by="ticker",
+                               auto_adjust=False, threads=True, progress=False)
+        except Exception as e:
+            print(f"[注意] 5分足の取得エラー: {e}", file=sys.stderr)
+            continue
+        for t, bars in _split_download(data, part).items():
+            idx = bars.index
+            idx = idx.tz_convert("Asia/Tokyo") if idx.tz is not None else idx.tz_localize("Asia/Tokyo")
+            bars = bars.copy()
+            bars.index = idx
+            cut = datetime(today.year, today.month, today.day, *cutoff_hm, tzinfo=JST)
+            b = bars[(bars.index.date == today) & (bars.index < cut)]
+            if b.empty:
+                continue
+            row = {"Open": b["Open"].iloc[0], "High": b["High"].max(), "Low": b["Low"].min(),
+                   "Close": b["Close"].iloc[-1], "Volume": b["Volume"].sum()}
+            row["Adj Close"] = row["Close"]
+            df = prices[t]
+            df = df[[pd.Timestamp(d).date() != today for d in df.index]].copy()
+            new = pd.DataFrame([row], index=[pd.Timestamp(today)])
+            prices[t] = pd.concat([df, new[[c for c in df.columns if c in new.columns]]]).sort_index()
+            replaced += 1
+        time.sleep(1.0)
+    return replaced
+
+
+# ---------------------------------------------------------------- 指標計算
+def calc_metrics(df: pd.DataFrame, mode: str, today: date) -> dict | None:
+    df = df.sort_index()
+    idx_dates = pd.Index([pd.Timestamp(d).date() for d in df.index])
+    df = df.copy()
+    df.index = idx_dates
+    flag = ""
+    if mode == "morning":
+        df = df[df.index < today]                  # 当日の途中データは使わない
+    else:
+        if len(df) == 0 or df.index[-1] != today:
+            flag = "当日データなし"
+    if len(df) < 16:
+        return None
+
+    cur, prev = df.iloc[-1], df.iloc[-2]
+    hist = df.iloc[:-1]                             # 当日を含まない過去
+    pc = prev["Close"]
+    if not pc or np.isnan(pc):
+        return None
+
+    tr = pd.concat([
+        hist["High"] - hist["Low"],
+        (hist["High"] - hist["Close"].shift()).abs(),
+        (hist["Low"] - hist["Close"].shift()).abs(),
+    ], axis=1).max(axis=1)
+    atr = tr.tail(14).mean()
+
+    typical = (df["High"] + df["Low"] + df["Close"]) / 3
+    turnover = typical * df["Volume"] / 1e8          # 売買代金（概算・億円）
+    vol_avg = hist["Volume"].tail(20).mean()
+
+    rng_pct = (cur["High"] - cur["Low"]) / pc * 100
+    atr_pct = atr / pc * 100
+    return {
+        "データ日付": df.index[-1].isoformat(),
+        "現在値": round(float(cur["Close"]), 1),
+        "前日比%": round((cur["Close"] / pc - 1) * 100, 2),
+        "始値比%": round((cur["Close"] / cur["Open"] - 1) * 100, 2) if cur["Open"] else np.nan,
+        "日中値幅%": round(rng_pct, 2),
+        "ATR14%": round(atr_pct, 2),
+        "値幅/ATR": round(rng_pct / atr_pct, 2) if atr_pct else np.nan,
+        "出来高": int(cur["Volume"]) if not np.isnan(cur["Volume"]) else np.nan,
+        "出来高倍率": round(cur["Volume"] / vol_avg, 2) if vol_avg else np.nan,
+        "売買代金_億円": round(float(turnover.iloc[-1]), 1),
+        "売買代金20日平均_億円": round(float(turnover.iloc[:-1].tail(20).mean()), 1),
+        "備考": flag,
+    }
+
+
+def build_stock_table(prices: dict[str, pd.DataFrame], uni: pd.DataFrame,
+                      mode: str, today: date) -> pd.DataFrame:
+    rows = []
+    meta = uni.set_index("ticker")
+    for t, df in prices.items():
+        m = calc_metrics(df, mode, today)
+        if m is None or t not in meta.index:
+            continue
+        rows.append({"コード": meta.at[t, "コード"], "銘柄名": meta.at[t, "銘柄名"],
+                     "業種": meta.at[t, "業種"], **m})
+    return pd.DataFrame(rows)
+
+
+def build_sector_table(stocks: pd.DataFrame) -> pd.DataFrame:
+    g = stocks.groupby("業種")
+    sec = pd.DataFrame({
+        "構成銘柄数": g.size(),
+        "平均騰落率%": g["前日比%"].mean().round(2),
+        "中央値騰落率%": g["前日比%"].median().round(2),
+        "上昇数": g["前日比%"].apply(lambda s: int((s > 0).sum())),
+        "下落数": g["前日比%"].apply(lambda s: int((s < 0).sum())),
+        "平均日中値幅%": g["日中値幅%"].mean().round(2),
+        "平均値幅/ATR": g["値幅/ATR"].mean().round(2),
+        "売買代金合計_億円": g["売買代金_億円"].sum().round(1),
+    })
+    # 代表銘柄 = 売買代金上位2銘柄
+    rep = (stocks.sort_values("売買代金_億円", ascending=False)
+           .groupby("業種").head(2)
+           .assign(lbl=lambda d: d["銘柄名"] + "(" + d["前日比%"].map("{:+.2f}%".format) + ")")
+           .groupby("業種")["lbl"].apply(" / ".join))
+    sec["代表銘柄"] = rep
+    sec = sec.sort_values("平均騰落率%", ascending=False)
+    sec.insert(0, "順位", range(1, len(sec) + 1))
+    n = len(sec)
+    sec["区分"] = ""
+    sec.loc[sec["順位"] <= 3, "区分"] = "上位3"
+    sec.loc[sec["順位"] > n - 3, "区分"] = "下位3"
+    big = (sec["区分"] == "") & (sec["平均騰落率%"].abs() >= 2)
+    sec.loc[big, "区分"] = "±2%以上"
+    return sec.reset_index()
+
+
+def sort_stocks(stocks: pd.DataFrame, sectors: pd.DataFrame) -> pd.DataFrame:
+    rank = sectors.set_index("業種")["順位"]
+    s = stocks.copy()
+    s.insert(0, "業種順位", s["業種"].map(rank))
+    return s.sort_values(["業種順位", "日中値幅%"], ascending=[True, False]).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------- まとめ（Actions画面用）
+def markdown_summary(mode: str, now: datetime, sectors: pd.DataFrame, stocks: pd.DataFrame,
+                     warn: str | None, min_turnover: float) -> str:
+    L = [f"## 33業種スキャン：{MODE_LABEL[mode]}",
+         f"取得 {now:%Y-%m-%d %H:%M} JST（Yahoo Finance・約20分遅延）／対象 {len(stocks)}銘柄", ""]
+    if warn:
+        L += [f"> ⚠ {warn}", ""]
+    if (stocks["備考"] == "当日データなし").mean() > 0.5:
+        L += ["> ⚠ 多くの銘柄で当日データがありません（休場日の可能性）。", ""]
+    L += ["| 順位 | 業種 | 騰落率 | 日中値幅 | 値幅/ATR | 売買代金(億) | 銘柄数 |",
+          "|---|---|---|---|---|---|---|"]
+    show = sectors[sectors["区分"] != ""]
+    for _, r in show.iterrows():
+        L.append(f"| {r['順位']} | {r['業種']} | {r['平均騰落率%']:+.2f}% | {r['平均日中値幅%']:.2f}% | "
+                 f"{r['平均値幅/ATR']:.2f} | {r['売買代金合計_億円']:,.0f} | {r['構成銘柄数']} |")
+    L += ["", f"### 上位・下位業種の値幅が大きい銘柄（売買代金{min_turnover:g}億円以上）"]
+    for _, r in show.iterrows():
+        cand = stocks[(stocks["業種"] == r["業種"]) & (stocks["売買代金_億円"] >= min_turnover)]
+        cand = cand.nlargest(5, "日中値幅%")
+        if cand.empty:
+            continue
+        L.append(f"**{r['業種']}**（{r['平均騰落率%']:+.2f}%）")
+        for _, s in cand.iterrows():
+            L.append(f"- {s['コード']} {s['銘柄名']}：前日比 {s['前日比%']:+.2f}%／値幅 {s['日中値幅%']:.2f}%"
+                     f"／値幅/ATR {s['値幅/ATR']:.2f}／出来高倍率 {s['出来高倍率']:.2f}"
+                     f"／売買代金 {s['売買代金_億円']:,.0f}億")
+        L.append("")
+    return "\n".join(L)
+
+
+def _stock_line(s: pd.Series) -> str:
+    return (f"| {s['コード']} | {s['銘柄名']} | {s['業種']} | {s['現在値']:,.1f} | {s['前日比%']:+.2f}% | "
+            f"{s['日中値幅%']:.2f}% | {s['値幅/ATR']:.2f} | {s['出来高倍率']:.2f} | {s['売買代金_億円']:,.0f} | {s['備考']} |")
+
+
+STOCK_HEAD = ["| コード | 銘柄名 | 業種 | 現在値 | 前日比 | 日中値幅 | 値幅/ATR | 出来高倍率 | 売買代金(億) | 備考 |",
+              "|---|---|---|---|---|---|---|---|---|---|"]
+
+
+def report_markdown(mode: str, now: datetime, stocks: pd.DataFrame, watch: list[str],
+                    basis: str, min_turnover: float) -> str:
+    """Claudeのレポートが読む用のまとめ（data/latest_<mode>.md）。"""
+    data_date = stocks["データ日付"].mode().iloc[0] if not stocks.empty else ""
+    L = [f"# 33業種スキャン {MODE_LABEL[mode]}",
+         "",
+         f"- 取得時刻: {now:%Y-%m-%d %H:%M} JST",
+         f"- データの日付: {data_date}",
+         f"- 数値の時点: {basis}",
+         "- 出典: Yahoo Finance（yfinance、東証は約20分遅延）",
+         "- 売買代金は (高値+安値+終値)/3×出来高 の概算。出来高倍率は過去20日平均との比較",
+         "",
+         "## ウォッチリスト", ""] + STOCK_HEAD
+    w = stocks.set_index("コード")
+    for code in watch:
+        if code in w.index:
+            L.append(_stock_line(w.loc[code].to_frame().T.assign(コード=code).iloc[0]))
+        else:
+            L.append(f"| {code} | 取得できず | | | | | | | | 未確認 |")
+    liquid = stocks[stocks["売買代金_億円"] >= min_turnover]
+    L += ["", f"## 日中値幅が大きい銘柄 上位15（売買代金{min_turnover:g}億円以上）", ""] + STOCK_HEAD
+    L += [_stock_line(s) for _, s in liquid.nlargest(15, "日中値幅%").iterrows()]
+    L += ["", f"## いつもより動いている銘柄 上位10（値幅/ATR順、売買代金{min_turnover:g}億円以上）", ""] + STOCK_HEAD
+    L += [_stock_line(s) for _, s in liquid.nlargest(10, "値幅/ATR").iterrows()]
+    return "\n".join(L) + "\n"
+
+
+# ---------------------------------------------------------------- メイン
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="東証プライム 33業種・銘柄スキャン")
+    ap.add_argument("--mode", default="auto", choices=["auto", "morning", "yori", "zenba", "close"])
+    ap.add_argument("--top", type=int, default=300, help="前場後・大引け後に使う売買代金上位の銘柄数")
+    ap.add_argument("--min-turnover", type=float, default=10.0,
+                    help="まとめに載せる銘柄の売買代金下限（億円）")
+    ap.add_argument("--refresh-universe", action="store_true", help="JPX銘柄一覧を再取得する")
+    args = ap.parse_args(argv)
+
+    now = datetime.now(JST)
+    today = now.date()
+    mode = resolve_mode(args.mode, now)
+    warn = timing_warning(mode, now)
+    print(f"モード: {MODE_LABEL[mode]}  ({now:%Y-%m-%d %H:%M} JST)")
+    if warn:
+        print(f"[注意] {warn}")
+
+    uni = load_universe(force=args.refresh_universe)
+    watch = load_watchlist()
+
+    if mode == "morning":
+        target = uni
+    else:
+        target = uni
+        if TOPN_FILE.exists():
+            top = pd.read_csv(TOPN_FILE, dtype=str)
+            target = uni[uni["ticker"].isin(top["ticker"])]
+            print(f"売買代金上位リスト（{top['作成日'].iloc[0]}作成）の {len(target)}銘柄を対象にします")
+            if top["作成日"].iloc[0] != today.isoformat():
+                print("[注意] 上位リストが今日の朝のものではありません。朝モードを先に実行すると更新されます。")
+        else:
+            print("[注意] 売買代金上位リストがないため、プライム全銘柄を対象にします。")
+        watch_t = [c + ".T" for c in watch]
+        target = uni[uni["ticker"].isin(set(target["ticker"]) | set(watch_t))]
+
+    prices = download_prices(target["ticker"].tolist())
+    basis = {"morning": "前日の終値（確定値）",
+             "yori": f"約20分遅延のため {(now - timedelta(minutes=20)):%H:%M}ごろまで",
+             "zenba": "前場（〜11:30）",
+             "close": "大引け（確定値）"}[mode]
+    if mode == "zenba":
+        n = apply_session_cut(prices, today, (11, 30))
+        print(f"前場の5分足で当日値を置き換え: {n}/{len(prices)}銘柄")
+        if n < len(prices) * 0.5:
+            basis = f"日足（{(now - timedelta(minutes=20)):%H:%M}ごろまで。後場が混ざっている可能性あり）"
+    stocks = build_stock_table(prices, uni, mode, today)
+    if stocks.empty:
+        print("データが取得できませんでした。", file=sys.stderr)
+        return 1
+
+    sectors = build_sector_table(stocks)
+    stocks = sort_stocks(stocks, sectors)
+    stamp = now.strftime("%Y-%m-%d %H:%M")
+    for df in (sectors, stocks):
+        df["取得時刻JST"] = stamp
+        df["出典"] = "Yahoo Finance(約20分遅延)"
+
+    DATA_DIR.mkdir(exist_ok=True)
+    base = DATA_DIR / f"{today.isoformat()}_{mode}"
+    sectors.to_csv(f"{base}_sectors.csv", index=False, encoding="utf-8-sig")
+    stocks.to_csv(f"{base}_stocks.csv", index=False, encoding="utf-8-sig")
+    print(f"出力: {base}_sectors.csv / {base}_stocks.csv")
+
+    if mode == "morning":
+        top = stocks.nlargest(args.top, "売買代金20日平均_億円")[["コード", "銘柄名", "業種"]].copy()
+        top["ticker"] = top["コード"] + ".T"
+        top["作成日"] = today.isoformat()
+        top.to_csv(TOPN_FILE, index=False, encoding="utf-8-sig")
+        print(f"売買代金上位 {len(top)}銘柄のリストを更新: {TOPN_FILE.name}")
+
+    report = report_markdown(mode, now, stocks, watch, basis, args.min_turnover)
+    (DATA_DIR / f"latest_{mode}.md").write_text(report, encoding="utf-8")
+    print(f"レポート用まとめ: data/latest_{mode}.md")
+
+    summary = markdown_summary(mode, now, sectors, stocks, warn, args.min_turnover)
+    summary += "\n\n" + report.split("\n", 1)[1]
+    print("\n" + summary)
+    if os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+            f.write(summary + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
