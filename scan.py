@@ -280,8 +280,16 @@ def sanitize_intraday(prices: dict[str, pd.DataFrame], bars_map: dict[str, pd.Da
         d_open, prev_close = df["Open"].iloc[i], df["Close"].iloc[i - 1]
         if not (d_open == d_open and prev_close == prev_close) or not d_open:
             continue
-        first = b.iloc[0].copy()
         near = lambda v: v == v and abs(v / prev_close - 1) < 1e-4
+        # 寄り付き前の「前日終値だけの足」（4本値すべて前日終値）は取り除く
+        lead = 0
+        while lead < len(b) - 1 and all(near(b[k].iloc[lead]) for k in ("Open", "High", "Low", "Close")):
+            lead += 1
+        if lead:
+            b = b.iloc[lead:]
+            bars_map[t] = b
+            fixed += 1
+        first = b.iloc[0].copy()
         if not near(first["Open"]) or abs(d_open / prev_close - 1) < 1e-4:
             continue                                   # 汚れていない／本当に前日終値で寄った
         c = first["Close"]
