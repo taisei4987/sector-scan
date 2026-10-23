@@ -264,6 +264,39 @@ def fetch_intraday(tickers: list[str], today: date, cutoff_hm: tuple[int, int] |
     return out
 
 
+def sanitize_intraday(prices: dict[str, pd.DataFrame], bars_map: dict[str, pd.DataFrame],
+                      today: date) -> int:
+    """Yahooの5分足は、最初の足の始値・高値・安値が「前日終値」になっていることがある。
+    日足の当日始値（正しい寄り付き値）で最初の足を補正する。戻り値は補正した銘柄数。"""
+    fixed = 0
+    for t, b in bars_map.items():
+        df = prices.get(t)
+        if df is None or b.empty:
+            continue
+        dates = [pd.Timestamp(d).date() for d in df.index]
+        if today not in dates or dates.index(today) == 0:
+            continue
+        i = dates.index(today)
+        d_open, prev_close = df["Open"].iloc[i], df["Close"].iloc[i - 1]
+        if not (d_open == d_open and prev_close == prev_close) or not d_open:
+            continue
+        first = b.iloc[0].copy()
+        near = lambda v: v == v and abs(v / prev_close - 1) < 1e-4
+        if not near(first["Open"]) or abs(d_open / prev_close - 1) < 1e-4:
+            continue                                   # 汚れていない／本当に前日終値で寄った
+        c = first["Close"]
+        first["Open"] = d_open
+        if near(first["High"]):
+            first["High"] = max(d_open, c)
+        if near(first["Low"]):
+            first["Low"] = min(d_open, c)
+        b = b.copy()
+        b.iloc[0] = first
+        bars_map[t] = b
+        fixed += 1
+    return fixed
+
+
 def replace_today_row(prices: dict[str, pd.DataFrame], bars_map: dict[str, pd.DataFrame],
                       today: date) -> int:
     """5分足から作った当日OHLCVで、日足の当日行を置き換える（前場後モード用）。"""
@@ -437,7 +470,9 @@ def build_market_table(mode: str, today: date, cutoff_hm: tuple[int, int] | None
     tickers = list(MARKET_TICKERS)
     prices = download_prices(tickers)
     bars_map = fetch_intraday(tickers, today, cutoff_hm) if mode != "morning" else {}
-    if cutoff_hm:
+    sanitize_intraday(prices, bars_map, today)
+    now = datetime.now(JST)
+    if cutoff_hm and now.hour * 60 + now.minute >= 12 * 60 + 50:
         replace_today_row(prices, bars_map, today)
     rows = []
     for t, name in MARKET_TICKERS.items():
@@ -701,7 +736,10 @@ def main(argv: list[str] | None = None) -> int:
     if mode != "morning":
         bars_map = fetch_intraday(tickers, today, cutoff)
         print(f"当日の5分足を取得: {len(bars_map)}/{len(tickers)}銘柄")
-    if mode == "zenba":
+    if bars_map:
+        print(f"5分足の最初の足を補正: {sanitize_intraday(prices, bars_map, today)}銘柄")
+    # 12:50より前なら、20分遅延の日足はまだ前場の値だけなので日足をそのまま使う
+    if mode == "zenba" and now.hour * 60 + now.minute >= 12 * 60 + 50:
         n = replace_today_row(prices, bars_map, today)
         print(f"前場の5分足で当日値を置き換え: {n}/{len(prices)}銘柄")
         if n < len(prices) * 0.5:
