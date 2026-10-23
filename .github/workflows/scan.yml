@@ -1,0 +1,53 @@
+name: 33業種スキャン
+
+on:
+  schedule:
+    # GitHubの予約はUTC。日本時間 = UTC + 9時間
+    - cron: "30 22 * * 0-4"   # 朝      7:30 JST（月〜金）
+    - cron: "30 0 * * 1-5"    # 寄り後  9:30 JST（月〜金）
+    - cron: "55 2 * * 1-5"    # 前場後 11:55 JST（月〜金）
+    - cron: "55 6 * * 1-5"    # 大引け後 15:55 JST（月〜金）
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "auto=時刻で自動判定 / morning=朝(前日) / yori=寄り後 / zenba=前場後 / close=大引け後"
+        type: choice
+        options: [auto, morning, yori, zenba, close]
+        default: auto
+      top:
+        description: "前場後・大引け後に使う売買代金上位の銘柄数"
+        default: "300"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: スキャン実行
+        env:
+          TZ: Asia/Tokyo
+          MODE: ${{ github.event.schedule == '30 22 * * 0-4' && 'morning' || github.event.schedule == '30 0 * * 1-5' && 'yori' || github.event.schedule == '55 2 * * 1-5' && 'zenba' || github.event.schedule == '55 6 * * 1-5' && 'close' || inputs.mode || 'auto' }}
+          TOP: ${{ inputs.top || '300' }}
+        run: python scan.py --mode "$MODE" --top "$TOP"
+      - name: 結果をリポジトリに保存
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git diff --cached --quiet && exit 0
+          git commit -m "scan: $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M')"
+          git pull --rebase
+          git push
