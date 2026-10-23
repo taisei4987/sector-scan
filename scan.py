@@ -290,14 +290,16 @@ def sanitize_intraday(prices: dict[str, pd.DataFrame], bars_map: dict[str, pd.Da
             bars_map[t] = b
             fixed += 1
         first = b.iloc[0].copy()
-        if not near(first["Open"]) or abs(d_open / prev_close - 1) < 1e-4:
-            continue                                   # 汚れていない／本当に前日終値で寄った
+        if abs(first["Open"] / d_open - 1) < 1e-6 or abs(first["Open"] / d_open - 1) > 0.3:
+            continue                                   # 始値は正しい／日足と5分足が別物すぎる
         c = first["Close"]
-        first["Open"] = d_open
-        if near(first["High"]):
+        if near(first["High"]) and not near(d_open):
             first["High"] = max(d_open, c)
-        if near(first["Low"]):
+        if near(first["Low"]) and not near(d_open):
             first["Low"] = min(d_open, c)
+        first["Open"] = d_open                         # 始値は日足の正式な始値に合わせる
+        first["High"] = max(first["High"], d_open)
+        first["Low"] = min(first["Low"], d_open)
         b = b.copy()
         b.iloc[0] = first
         bars_map[t] = b
