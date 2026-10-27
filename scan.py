@@ -438,6 +438,7 @@ def calc_metrics(df: pd.DataFrame, mode: str, today: date,
         "データ日付": df.index[-1].isoformat(),
         "現在値": round(float(cur["Close"]), 1),
         "前日比%": round((cur["Close"] / pc - 1) * 100, 2),
+        "ギャップ%": round((cur["Open"] / pc - 1) * 100, 2) if cur["Open"] else np.nan,
         "始値比_日足%": round((cur["Close"] / cur["Open"] - 1) * 100, 2) if cur["Open"] else np.nan,
         "日中値幅%": round(rng_pct, 2),
         "ATR14%": round(atr_pct, 2),
@@ -624,13 +625,13 @@ def _head(cols: list[str]) -> list[str]:
     return [_row(cols), _row(["---"] * len(cols))]
 
 
-STOCK_COLS = ["コード", "銘柄名", "業種", "現在値", "前日比", "日中値幅", "値幅/ATR", "出来高倍率",
+STOCK_COLS = ["コード", "銘柄名", "業種", "現在値", "前日比", "ギャップ", "日中値幅", "値幅/ATR", "出来高倍率",
               "売買代金(億)", "環境", "25日線比", "当日の流れ", "始値比", "VWAP比", "高安", "前日レンジ", "備考"]
 
 
 def _stock_line(s: pd.Series) -> str:
     return _row([str(s["コード"]), str(s["銘柄名"]), str(s["業種"]), _f(s["現在値"], "{:,.1f}"),
-                 _f(s["前日比%"], "{:+.2f}%"), _f(s["日中値幅%"], "{:.2f}%"), _f(s["値幅/ATR"], "{:.2f}"),
+                 _f(s["前日比%"], "{:+.2f}%"), _f(s["ギャップ%"], "{:+.2f}%"), _f(s["日中値幅%"], "{:.2f}%"), _f(s["値幅/ATR"], "{:.2f}"),
                  _f(s["出来高倍率"], "{:.2f}"), _f(s["売買代金_億円"], "{:,.0f}"), _f(s["環境"]),
                  _f(s["25日線比%"], "{:+.2f}%"), _f(s["当日の流れ"]), _f(s["始値比%"], "{:+.2f}%"),
                  _f(s["VWAP比%"], "{:+.2f}%"), _f(s["高安"]), _f(s["前日レンジ"]), _f(s["備考"] or "")])
@@ -688,6 +689,10 @@ def report_markdown(mode: str, now: datetime, stocks: pd.DataFrame, sectors: pd.
     L += _head(STOCK_COLS) + [_stock_line(s) for _, s in liquid.nlargest(15, "日中値幅%").iterrows()]
     L += ["", f"### 候補銘柄：いつもより動いている 上位10（値幅/ATR順、売買代金{min_turnover:g}億円以上）", ""]
     L += _head(STOCK_COLS) + [_stock_line(s) for _, s in liquid.nlargest(10, "値幅/ATR").iterrows()]
+    gap = liquid.assign(_g=liquid["ギャップ%"].abs()).nlargest(10, "_g")
+    L += ["", f"### 候補銘柄：ギャップ（寄り付きの窓）が大きい 上位10（|ギャップ|順、売買代金{min_turnover:g}億円以上）",
+          "", "ギャップ＝始値の前日終値比。日中値幅にはギャップ分が含まれないため、別に並べる。", ""]
+    L += _head(STOCK_COLS) + [_stock_line(s) for _, s in gap.iterrows()]
 
     L += ["", "## ウォッチリスト", ""] + _head(STOCK_COLS)
     w = stocks.drop_duplicates("コード").set_index("コード", drop=False)
